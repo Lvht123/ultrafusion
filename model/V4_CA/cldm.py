@@ -120,7 +120,7 @@ class ControlLDM(nn.Module):
             with torch.no_grad():
                 # tile_images = torch.cat([tile_image_ue, tile_image], dim=1)
                 # skip_feat = fidelity_encoder(tile_images)
-                if fidelity_input is not None:
+                if fidelity_input is not None and fidelity_encoder is not None:
                     skip_feat = fidelity_encoder(tile_fidelity_input)
                     skip_feats.append(skip_feat)
                 else:

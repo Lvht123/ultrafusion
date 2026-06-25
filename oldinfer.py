@@ -1,6 +1,5 @@
-import os, tqdm, math, csv
+import os, tqdm, math
 import torch
-import pyiqa
 import numpy as np
 from argparse import ArgumentParser
 from collections import OrderedDict
@@ -15,16 +14,6 @@ from dataset.test_dataset import TestDataset, LowLightTestDataset, get_color_and
 from model.raft.raft import RAFT
 from utils.common import instantiate_from_config
 from utils.flow import backward_warp, forward_backward_consistency_check, IMF
-
-
-def pad_to_min_size(tensor, min_size=224):
-    """Pad image tensor to at least min_size x min_size (required for MUSIQ)."""
-    _, _, h, w = tensor.shape
-    if h < min_size or w < min_size:
-        pad_h = max(0, min_size - h)
-        pad_w = max(0, min_size - w)
-        tensor = F.pad(tensor, (0, pad_w, 0, pad_h), mode="reflect")
-    return tensor
 
 
 def pad_imgv3(x, crop_size, crop_step):
@@ -189,13 +178,9 @@ def lowlight_enhance(swir, lowlight, img_name, pipe, args, consistent_start=None
     swir = pad_img(swir, 16)
     lowlight = pad_img(lowlight, 16)
 
-    if not args.tiled:
-        swir = F.interpolate(swir, size=(512, 512), mode='bilinear', align_corners=False)
-        lowlight = F.interpolate(lowlight, size=(512, 512), mode='bilinear', align_corners=False)
-
     if args.tiled:
-        swir = pad_imgv3(swir, args.tile_size, args.tile_stride)
         lowlight = pad_imgv3(lowlight, args.tile_size, args.tile_stride)
+        swir = pad_imgv3(swir, args.tile_size, args.tile_stride)
 
     swir_struct, swir_color = get_color_and_struct(isrgb=True, input_img=swir, ksize=7, sigmaX=0, c=0.0000001)
     swir_struct, swir_color = swir_struct.unsqueeze(dim=0), swir_color.unsqueeze(dim=0)
@@ -222,7 +207,6 @@ def lowlight_enhance(swir, lowlight, img_name, pipe, args, consistent_start=None
     else:
         set_seed(args.seed)
         out = pipe.run(lq2=lowlight, lq1_mscn_norm=swir_struct, lq1_color=swir_color, tiled=args.tiled, tile_size=args.tile_size, tile_stride=args.tile_stride, cond_fn=cond_fn)
-        out = F.interpolate(out, size=(H, W), mode='bilinear', align_corners=False)
 
     out = out[:, :, :H, :W]
     swir = swir[:, :, :H, :W]
@@ -248,7 +232,7 @@ parser.add_argument("--tiled", action='store_true', default=False)
 parser.add_argument("--tile_size", type=int, default=512)
 parser.add_argument("--tile_stride", type=int, default=256)
 parser.add_argument("--device", type=str, default="cuda", choices=["cpu", "cuda", "mps"])
-parser.add_argument("--seed", type=int, default=231)
+parser.add_argument("--seed", type=int, default=231, choices=["cpu", "cuda", "mps"])
 parser.add_argument("--prealign", action='store_true', default=False)
 parser.add_argument("--save_all", action='store_true', default=False)
 parser.add_argument("--data_dir", type=str, default='', help='path to test data dir (for LowLight dataset)')
@@ -298,18 +282,6 @@ cond_fn = None
 
 pipe = UltraFusionPipeline(cldm=cldm, diffusion=diffusion, fidelity_encoder=fidelity_encoder, device=args.device)
 
-# ============================================================
-# Metrics setup: PSNR, SSIM, NIQE, MUSIQ, CLIPIQA+, BRISQUE
-# ============================================================
-print("Loading metrics...")
-psnr_metric = pyiqa.create_metric("psnr", device=args.device)
-ssim_metric = pyiqa.create_metric("ssim", device=args.device)
-niqe_metric = pyiqa.create_metric("niqe", device=args.device)
-musiq_metric = pyiqa.create_metric("musiq", device=args.device)
-clipiqa_metric = pyiqa.create_metric("clipiqa+", device=args.device)
-brisque_metric = pyiqa.create_metric("brisque", device=args.device)
-print("Metrics loaded.\n")
-
 to_tensor = ToTensor()
 
 if args.dataset == 'LowLight':
@@ -329,131 +301,14 @@ args.output = os.path.join(args.output, args.dataset)
 if not os.path.exists(args.output):
     os.mkdir(args.output)
 
-psnr_list = []
-ssim_list = []
-niqe_list = []
-musiq_list = []
-clipiqa_list = []
-brisque_list = []
-
-for batch in tqdm.tqdm(dataloader):
+for batch in dataloader:
     img_name = batch['file_name'][0]
 
     if args.dataset == 'LowLight':
         swir = batch['swir'].cuda()
         lowlight = batch['lowlight'].cuda()
-        label = batch['label'].cuda()
-        out = lowlight_enhance(swir=swir, lowlight=lowlight, img_name=img_name, pipe=pipe, args=args, consistent_start=None)
-        # [-1, 1] -> [0, 1] for metric computation
-        out_vis = (out + 1) / 2
-        out_vis = out_vis.clamp(0.0, 1.0)
-        if out_vis.shape[-2:] != label.shape[-2:]:
-            out_vis = F.interpolate(out_vis, size=label.shape[-2:], mode='bilinear', align_corners=False)
-
-        # Full-reference metrics: PSNR, SSIM
-        psnr_val = psnr_metric(out_vis, label).item()
-        ssim_val = ssim_metric(out_vis, label).item()
-        psnr_list.append(psnr_val)
-        ssim_list.append(ssim_val)
-
-        # No-reference metrics: NIQE, MUSIQ, CLIPIQA+, BRISQUE
-        out_padded = pad_to_min_size(out_vis, min_size=224)
-        with torch.no_grad():
-            niqe_val = niqe_metric(out_padded).item()
-            musiq_val = musiq_metric(out_padded).item()
-            clipiqa_val = clipiqa_metric(out_padded).item()
-            brisque_val = brisque_metric(out_padded).item()
-        niqe_list.append(niqe_val)
-        musiq_list.append(musiq_val)
-        clipiqa_list.append(clipiqa_val)
-        brisque_list.append(brisque_val)
-
-        print(f"  {img_name}: PSNR={psnr_val:.4f}, SSIM={ssim_val:.4f}, NIQE={niqe_val:.4f}, MUSIQ={musiq_val:.4f}, CLIPIQA+={clipiqa_val:.4f}, BRISQUE={brisque_val:.4f}")
+        _ = lowlight_enhance(swir=swir, lowlight=lowlight, img_name=img_name, pipe=pipe, args=args, consistent_start=None)
     else:
         ue = batch['ue'].cuda()
         oe = batch['oe'].cuda()
-        out = mef(img1=ue, img2=oe, img_name=img_name, flow_model=flow_model, pipe=pipe, args=args, consistent_start=None)
-
-        # No-reference metrics: NIQE, MUSIQ, CLIPIQA+, BRISQUE
-        out_vis = (out + 1) / 2  # [-1, 1] -> [0, 1]
-        out_vis = out_vis.clamp(0.0, 1.0)
-        out_padded = pad_to_min_size(out_vis, min_size=224)
-        with torch.no_grad():
-            niqe_val = niqe_metric(out_padded).item()
-            musiq_val = musiq_metric(out_padded).item()
-            clipiqa_val = clipiqa_metric(out_padded).item()
-            brisque_val = brisque_metric(out_padded).item()
-        niqe_list.append(niqe_val)
-        musiq_list.append(musiq_val)
-        clipiqa_list.append(clipiqa_val)
-        brisque_list.append(brisque_val)
-
-        print(f"  {img_name}: NIQE={niqe_val:.4f}, MUSIQ={musiq_val:.4f}, CLIPIQA+={clipiqa_val:.4f}, BRISQUE={brisque_val:.4f}")
-
-# ============================================================
-# Compute averages and save results
-# ============================================================
-if len(niqe_list) > 0:
-    avg_niqe = float(np.mean(niqe_list))
-    avg_musiq = float(np.mean(musiq_list))
-    avg_clipiqa = float(np.mean(clipiqa_list))
-    avg_brisque = float(np.mean(brisque_list))
-
-    print("=" * 70)
-    print(f"Average NIQE     : {avg_niqe:.4f}")
-    print(f"Average MUSIQ    : {avg_musiq:.4f}")
-    print(f"Average CLIPIQA+ : {avg_clipiqa:.4f}")
-    print(f"Average BRISQUE  : {avg_brisque:.4f}")
-
-    if args.dataset == 'LowLight' and len(psnr_list) > 0:
-        avg_psnr = float(np.mean(psnr_list))
-        avg_ssim = float(np.mean(ssim_list))
-        print(f"Average PSNR     : {avg_psnr:.4f} dB")
-        print(f"Average SSIM     : {avg_ssim:.4f}")
-    print("=" * 70)
-
-    # Save CSV
-    csv_path = os.path.join(args.output, 'metrics_result.csv')
-    with open(csv_path, 'w', newline='') as f:
-        writer = csv.writer(f)
-        if args.dataset == 'LowLight':
-            header = ['image', 'psnr', 'ssim', 'niqe', 'musiq', 'clipiqa+', 'brisque']
-            writer.writerow(header)
-            for i, name in enumerate(dataset.file_name_list):
-                writer.writerow([
-                    name,
-                    round(psnr_list[i], 4),
-                    round(ssim_list[i], 4),
-                    round(niqe_list[i], 4),
-                    round(musiq_list[i], 4),
-                    round(clipiqa_list[i], 4),
-                    round(brisque_list[i], 4),
-                ])
-            writer.writerow([
-                'AVERAGE',
-                round(avg_psnr, 4),
-                round(avg_ssim, 4),
-                round(avg_niqe, 4),
-                round(avg_musiq, 4),
-                round(avg_clipiqa, 4),
-                round(avg_brisque, 4),
-            ])
-        else:
-            header = ['image', 'niqe', 'musiq', 'clipiqa+', 'brisque']
-            writer.writerow(header)
-            for i, name in enumerate(dataset.file_name_list):
-                writer.writerow([
-                    name,
-                    round(niqe_list[i], 4),
-                    round(musiq_list[i], 4),
-                    round(clipiqa_list[i], 4),
-                    round(brisque_list[i], 4),
-                ])
-            writer.writerow([
-                'AVERAGE',
-                round(avg_niqe, 4),
-                round(avg_musiq, 4),
-                round(avg_clipiqa, 4),
-                round(avg_brisque, 4),
-            ])
-    print(f"Metrics saved to {csv_path}")
+        _ = mef(img1=ue, img2=oe, img_name=img_name, flow_model=flow_model, pipe=pipe, args=args, consistent_start=None)

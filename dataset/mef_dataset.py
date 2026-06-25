@@ -10,6 +10,7 @@ from torchvision.transforms import ToTensor, RandomCrop, CenterCrop, Resize, Ran
 
 from torch.utils.data import DataLoader
 from torchvision.utils import save_image
+from dataset.lowlight_pair_dataset_v2 import _simulate_low_light_viis, _reinforce_visible_with_mef
 
 
 def get_color_and_struct(isrgb, input_img: torch.Tensor, ksize, sigmaX, c):  #input an RGB image
@@ -69,106 +70,130 @@ def img2tensor(imgs, bgr2rgb=True, float32=True):
 
 
 class MEFDataset(data.Dataset):
-    def __init__(self, img_dir, motion_img_dir, random_crop=True, random_resize=True, rotate=True, flip=True):
+    def __init__(self, img_dir, swir_img_dir,
+                 random_crop=True, random_resize=True, rotate=True, flip=True,
+                 disable_visible_reinforce=True,
+                 mef_ev_list=(-1.0, -0.5, 0.0, 0.5, 1.0),
+                 mef_gamma_list=(1.10, 1.05, 1.00, 0.95, 0.90),
+                 mef_contrast_weight=1.0,
+                 mef_saturation_weight=1.0,
+                 mef_exposure_weight=1.0,
+                 mef_clahe_post=False,
+                 mef_clahe_clip=2.0,
+                 mef_clahe_grid=8,
+                 mef_blend_alpha=0.85,
+                 contrast_range=(0.15, 0.95),
+                 gamma_range=(2.2, 6.0),
+                 poisson_level=5.0,
+                 gaussian_sigma=10.0,
+                 use_salt_pepper=False,
+                 low_retry=3):
         super(MEFDataset, self).__init__()
         self.img_dir = img_dir
-        self.motion_img_dir = motion_img_dir
+        self.swir = swir_img_dir
         self.random_crop = random_crop
         self.random_resize = random_resize
         self.rotate = rotate
         self.flip = flip
         self.to_tensor = ToTensor()
-
-        self.ldr_list1 = []
-        self.ldr_list2 = []
+        self.swir_list = []
         self.gt_list = []
-        self.file_name_list = []
-        self.img_dir_subset_list = os.listdir(self.img_dir)
-        for img_dir_subset in self.img_dir_subset_list:
-            if img_dir_subset != 'Label':
-                self.ldr_list1.append(os.path.join(self.img_dir, img_dir_subset, 'se.JPG'))
-                self.ldr_list2.append(os.path.join(self.img_dir, img_dir_subset, 'le.JPG'))
-                gt_path1 = glob.glob(os.path.join(self.img_dir, 'Label', '{}.*'.format(img_dir_subset)))
-                gt_path2 = glob.glob(os.path.join(self.img_dir, 'Label', '{}_align.*'.format(img_dir_subset)))
-                if len(gt_path2) > 0:
-                    gt_path = gt_path2
-                else:
-                    gt_path = gt_path1
-                self.gt_list.append(gt_path[0])
-                self.file_name_list.append(img_dir_subset)
-        
-        self.motion_mask_list = os.listdir(self.motion_img_dir)
+        lq1_dir = os.path.join(self.img_dir, 'swir')
+        gt_dir = os.path.join(self.img_dir, 'rgb')
+
+        self.swir_list = sorted([os.path.join(lq1_dir, f) for f in os.listdir(lq1_dir)])
+        self.gt_list = sorted([os.path.join(gt_dir, f) for f in os.listdir(gt_dir)])
+
+        # Low-light simulation parameters
+        self.reinforce_visible = not bool(disable_visible_reinforce)
+        self.mef_ev_list = tuple(float(v) for v in mef_ev_list)
+        self.mef_gamma_list = tuple(float(v) for v in mef_gamma_list)
+        self.mef_contrast_weight = float(mef_contrast_weight)
+        self.mef_saturation_weight = float(mef_saturation_weight)
+        self.mef_exposure_weight = float(mef_exposure_weight)
+        self.mef_clahe_post = bool(mef_clahe_post)
+        self.mef_clahe_clip = float(mef_clahe_clip)
+        self.mef_clahe_grid = int(mef_clahe_grid)
+        self.mef_blend_alpha = float(mef_blend_alpha)
+        self.contrast_range = (float(contrast_range[0]), float(contrast_range[1]))
+        self.gamma_range = (float(gamma_range[0]), float(gamma_range[1]))
+        self.poisson_level = float(poisson_level)
+        self.gaussian_sigma = float(gaussian_sigma)
+        self.use_salt_pepper = bool(use_salt_pepper)
+        self.low_retry = int(low_retry)
 
     def __getitem__(self, index):
         gt_path = self.gt_list[index % len(self.gt_list)]
-        lq1_path = self.ldr_list1[index % len(self.gt_list)]
-        lq2_path = self.ldr_list2[index % len(self.gt_list)]
-        file_name = self.file_name_list[index % len(self.gt_list)]
-        lq1 = Image.open(lq1_path).convert('RGB')
-        lq2 = Image.open(lq2_path).convert('RGB')
+        swir_path = self.swir_list[index % len(self.gt_list)]
+        swir = Image.open(swir_path).convert('RGB')
         gt = Image.open(gt_path).convert('RGB')
 
         if 'align' in gt_path:
-            # crop black region caused by warp
             W, H = gt.size
             cc = CenterCrop([H - 100, W - 100])
-            lq1 = cc(lq1)
-            lq2 = cc(lq2)
+            swir = cc(swir)
             gt = cc(gt)
         if self.random_resize:
             W, H = gt.size
             min_size = 512
             max_size = min(H, W)
             tgt_size = torch.randint(min_size, max_size + 1, (1, )).item()
-            lq1 = Resize(tgt_size)(lq1)
-            lq2 = Resize(tgt_size)(lq2)
+            swir = Resize(tgt_size)(swir)
             gt = Resize(tgt_size)(gt)
         if self.random_crop:
             crop_params = RandomCrop.get_params(gt, [512, 512])
-            lq1 = crop(lq1, *crop_params)
-            lq2 = crop(lq2, *crop_params)
+            swir = crop(swir, *crop_params)
             gt = crop(gt, *crop_params)
         else:
-            lq1 = CenterCrop(512)(lq1)
-            lq2 = CenterCrop(512)(lq2)
+            swir = CenterCrop(512)(swir)
             gt = CenterCrop(512)(gt)
         if self.rotate:
             rotate_params = random.randint(0, 3) * 90
-            lq1 = rotate(lq1, rotate_params)
-            lq2 = rotate(lq2, rotate_params)
+            swir = rotate(swir, rotate_params)
             gt = rotate(gt, rotate_params)
         if self.flip:
             if torch.rand(1) > 0.5:
-                lq1 = RandomHorizontalFlip(1)(lq1)
-                lq2 = RandomHorizontalFlip(1)(lq2)
+                swir = RandomHorizontalFlip(1)(swir)
                 gt = RandomHorizontalFlip(1)(gt)
             if torch.rand(1) > 0.5:
-                lq1 = RandomVerticalFlip(1)(lq1)
-                lq2 = RandomVerticalFlip(1)(lq2)
+                swir = RandomVerticalFlip(1)(swir)
                 gt = RandomVerticalFlip(1)(gt)
 
-        lq1 = self.to_tensor(lq1)
+        # Online low-light simulation from GT
+        gt_np = np.asarray(gt)
+        if self.reinforce_visible:
+            gt_np = _reinforce_visible_with_mef(
+                gt_np,
+                ev_list=self.mef_ev_list,
+                gamma_list=self.mef_gamma_list,
+                contrast_weight=self.mef_contrast_weight,
+                saturation_weight=self.mef_saturation_weight,
+                exposure_weight=self.mef_exposure_weight,
+                use_clahe_post=self.mef_clahe_post,
+                clahe_clip_limit=self.mef_clahe_clip,
+                clahe_tile_grid_size=self.mef_clahe_grid,
+                blend_with_original=self.mef_blend_alpha,
+            )
+        low_light_np = _simulate_low_light_viis(
+            gt_np,
+            contrast_range=self.contrast_range,
+            gamma_range=self.gamma_range,
+            poisson_level=self.poisson_level,
+            gaussian_sigma=self.gaussian_sigma,
+            use_salt_pepper=self.use_salt_pepper,
+            num_retry=self.low_retry,
+        )
+        lq2 = Image.fromarray(low_light_np, mode='RGB')
+        gt = Image.fromarray(gt_np, mode='RGB')
+
+        swir = self.to_tensor(swir)
         lq2 = self.to_tensor(lq2)
-        gt = self.to_tensor(gt) 
+        gt = self.to_tensor(gt)
 
-        motion_type = torch.rand(1)
-        if motion_type < 0.75:
-            # local motion
-            motion_ind = torch.randint(0, len(self.motion_mask_list), (1, )).item()
-            mask = Image.open(os.path.join(self.motion_img_dir, self.motion_mask_list[motion_ind])).convert('RGB').resize([512, 512])
-            mask = self.to_tensor(mask)
-            mask = mask[:1, :, :]
-            lq1_motion = lq1 * (1. - mask)
-        else:
-            mask = torch.zeros_like(gt)[:1, :, :]
-            lq1_motion = lq1
+        lq1_struct, lq1_color = get_color_and_struct(isrgb=True, input_img=swir, ksize=7, sigmaX=0, c=0.0000001)
 
-        lq1_struct, lq1_color = get_color_and_struct(isrgb=True, input_img=lq1_motion, ksize=7, sigmaX=0, c=0.0000001)
-        
         # Normalize to [-1, 1]
         gt = gt * 2 - 1
-        lq1 = lq1 * 2 - 1
-        lq1_motion = lq1_motion * 2 - 1
         lq2 = lq2 * 2 - 1
 
         return {
@@ -176,10 +201,7 @@ class MEFDataset(data.Dataset):
             'lq1_struct': lq1_struct,
             'lq1_color': lq1_color,
             'lq2': lq2,
-            'mask': mask,
-            # 'fm': fuse_map,
             'prompt': '',
-            'file_name': file_name
         }
 
     def __len__(self):

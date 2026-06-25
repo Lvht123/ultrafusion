@@ -87,3 +87,47 @@ class TestDataset(data.Dataset):
 
     def __len__(self):
         return len(self.ldr_list1)
+
+
+class LowLightTestDataset(data.Dataset):
+    def __init__(self, img_dir):
+        super(LowLightTestDataset, self).__init__()
+        self.swir_list = []
+        self.lowlight_list = []
+        self.label_list = []
+        self.file_name_list = []
+        self.to_tensor = ToTensor()
+
+        swir_dir = os.path.join(img_dir, 'swir')
+        lowlight_dir = os.path.join(img_dir, 'low')
+        label_dir = os.path.join(img_dir, 'gt')
+
+        swir_files = sorted(os.listdir(swir_dir))
+        lowlight_files = sorted(os.listdir(lowlight_dir))
+
+        for f in swir_files:
+            self.swir_list.append(os.path.join(swir_dir, f))
+
+        for f in lowlight_files:
+            self.lowlight_list.append(os.path.join(lowlight_dir, f))
+            self.label_list.append(os.path.join(label_dir, f))
+            self.file_name_list.append(os.path.splitext(f)[0])
+
+    def __getitem__(self, index):
+        swir = Image.open(self.swir_list[index]).convert('RGB')
+        lowlight = Image.open(self.lowlight_list[index]).convert('RGB')
+        label = Image.open(self.label_list[index]).convert('RGB')
+
+        swir = self.to_tensor(swir)
+        lowlight = self.to_tensor(lowlight)
+        label = self.to_tensor(label)
+
+        return {
+            'swir': swir,
+            'lowlight': lowlight,
+            'label': label,
+            'file_name': self.file_name_list[index]
+        }
+
+    def __len__(self):
+        return len(self.swir_list)

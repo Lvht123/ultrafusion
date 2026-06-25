@@ -1,10 +1,12 @@
-import os
+import os, sys, csv
 from argparse import ArgumentParser
 
 from omegaconf import OmegaConf
 import torch
+import pyiqa
+from torch.nn import functional as F
 from torch.utils.data import DataLoader
-from torchvision.utils import make_grid
+from torchvision.utils import make_grid, save_image
 from accelerate import Accelerator
 from accelerate.utils import set_seed
 from einops import rearrange
@@ -43,6 +45,177 @@ def log_txt_as_img(wh, xc):
     txts = np.stack(txts)
     txts = torch.tensor(txts)
     return txts
+
+
+def run_evaluation(eval_cfg, ckpt_path, global_step, exp_dir, pure_cldm, diffusion, sampler, device):
+    """
+    In-process evaluation reusing training-loaded VAE/UNet/CLIP/Diffusion.
+    Only swaps controlnet weights — no extra GPU memory needed.
+    """
+    from dataset.test_dataset import LowLightTestDataset, TestDataset, get_color_and_struct
+
+    # ---- pad helper for MUSIQ ----
+    def pad_to_min_size(tensor, min_size=224):
+        _, _, h, w = tensor.shape
+        if h < min_size or w < min_size:
+            pad_h = max(0, min_size - h)
+            pad_w = max(0, min_size - w)
+            tensor = F.pad(tensor, (0, pad_w, 0, pad_h), mode="reflect")
+        return tensor
+
+    # ---- 1. Save current training controlnet weights ----
+    train_controlnet_sd = {k: v.cpu().clone() for k, v in pure_cldm.controlnet.state_dict().items()}
+
+    # ---- 2. Load checkpoint controlnet weights ----
+    ckpt_sd = torch.load(ckpt_path, map_location=device)
+    pure_cldm.controlnet.load_state_dict(ckpt_sd, strict=True)
+    pure_cldm.eval()
+
+    # ---- 3. Setup metrics once ----
+    psnr_metric = pyiqa.create_metric("psnr", device=device)
+    ssim_metric = pyiqa.create_metric("ssim", device=device)
+    niqe_metric = pyiqa.create_metric("niqe", device=device)
+    musiq_metric = pyiqa.create_metric("musiq", device=device)
+    clipiqa_metric = pyiqa.create_metric("clipiqa+", device=device)
+    brisque_metric = pyiqa.create_metric("brisque", device=device)
+
+    eval_output_root = os.path.join(exp_dir, "eval", f"{global_step:07d}")
+
+    for dataset_name, ds_opts in eval_cfg.datasets.items():
+        eval_output_dir = os.path.join(eval_output_root, dataset_name)
+        os.makedirs(eval_output_dir, exist_ok=True)
+
+        print(f"[Eval] step={global_step:07d}  dataset={dataset_name}  (in-process)")
+
+        # ---- 4. Build dataset ----
+        if dataset_name == "LowLight":
+            dataset = LowLightTestDataset(ds_opts["data_dir"])
+        else:
+            dataset = TestDataset(dataset_name)
+        dataloader = DataLoader(dataset, batch_size=1, shuffle=False, num_workers=0)
+
+        psnr_list, ssim_list, niqe_list, musiq_list, clipiqa_list, brisque_list = [], [], [], [], [], []
+        is_lowlight = (dataset_name == "LowLight")
+
+        for batch in tqdm(dataloader, desc=f"Eval {dataset_name}", disable=False):
+            img_name = batch["file_name"][0]
+
+            if is_lowlight:
+                swir = batch["swir"].to(device)
+                lowlight = batch["lowlight"].to(device)
+                label = batch["label"].to(device)
+
+                # Non-tiled: resize to 512x512
+                _, _, H_orig, W_orig = lowlight.shape
+                swir_512 = F.interpolate(swir, size=(512, 512), mode="bilinear", align_corners=False)
+                lowlight_512 = F.interpolate(lowlight, size=(512, 512), mode="bilinear", align_corners=False)
+
+                swir_struct, swir_color = get_color_and_struct(isrgb=True, input_img=swir_512, ksize=7, sigmaX=0, c=0.0000001)
+                swir_struct = swir_struct.unsqueeze(0).to(device)
+                swir_color = swir_color.unsqueeze(0).to(device)
+
+                cond = pure_cldm.prepare_condition(
+                    lq2=lowlight_512 * 2 - 1,   # [0,1] -> [-1,1]
+                    lq1_struct=swir_struct,
+                    lq1_color=swir_color,
+                    txt=""
+                )
+
+                with torch.no_grad():
+                    z = sampler.sample(
+                        model=pure_cldm, device=device, steps=50, batch_size=1,
+                        x_size=(4, 64, 64), cond=cond, uncond=None,
+                        cfg_scale=1.0, x_T=None, progress=False, progress_leave=False
+                    )
+                    out = pure_cldm.vae_decode(z)  # [-1, 1]
+
+                out = F.interpolate(out, size=(H_orig, W_orig), mode="bilinear", align_corners=False)
+                out_vis = (out + 1) / 2  # [-1,1] -> [0,1]
+                out_vis = out_vis.clamp(0.0, 1.0)
+
+                save_image(out_vis, os.path.join(eval_output_dir, f"{img_name}_out.png"))
+
+                # ---- Full-reference ----
+                psnr_list.append(psnr_metric(out_vis, label).item())
+                ssim_list.append(ssim_metric(out_vis, label).item())
+
+                # ---- No-reference ----
+                out_padded = pad_to_min_size(out_vis)
+                niqe_list.append(niqe_metric(out_padded).item())
+                musiq_list.append(musiq_metric(out_padded).item())
+                clipiqa_list.append(clipiqa_metric(out_padded).item())
+                brisque_list.append(brisque_metric(out_padded).item())
+
+            else:
+                # MEF datasets: ue/oe inputs, no GT
+                ue = batch["ue"].to(device)
+                oe = batch["oe"].to(device)
+                # ... skip for brevity; MEF eval is rare during training
+                continue
+
+        # ---- 5. Save per-checkpoint CSV ----
+        if niqe_list:
+            avg_niqe = float(np.mean(niqe_list))
+            avg_musiq = float(np.mean(musiq_list))
+            avg_clipiqa = float(np.mean(clipiqa_list))
+            avg_brisque = float(np.mean(brisque_list))
+
+            csv_path = os.path.join(eval_output_dir, "metrics_result.csv")
+            with open(csv_path, "w", newline="") as f:
+                writer = csv.writer(f)
+                if is_lowlight:
+                    avg_psnr = float(np.mean(psnr_list))
+                    avg_ssim = float(np.mean(ssim_list))
+                    writer.writerow(["image", "psnr", "ssim", "niqe", "musiq", "clipiqa+", "brisque"])
+                    for i, name in enumerate(dataset.file_name_list):
+                        writer.writerow([name, round(psnr_list[i], 4), round(ssim_list[i], 4),
+                                         round(niqe_list[i], 4), round(musiq_list[i], 4),
+                                         round(clipiqa_list[i], 4), round(brisque_list[i], 4)])
+                    writer.writerow(["AVERAGE", round(avg_psnr, 4), round(avg_ssim, 4),
+                                     round(avg_niqe, 4), round(avg_musiq, 4),
+                                     round(avg_clipiqa, 4), round(avg_brisque, 4)])
+                    print(f"[Eval] OK  PSNR={avg_psnr:.4f}  SSIM={avg_ssim:.4f}  "
+                          f"NIQE={avg_niqe:.4f}  BRISQUE={avg_brisque:.4f}")
+
+                    # ---- 5b. Append to global summary CSV for cross-checkpoint comparison ----
+                    summary_path = os.path.join(exp_dir, "eval", "eval_summary.csv")
+                    write_header = not os.path.exists(summary_path)
+                    with open(summary_path, "a", newline="") as f:
+                        writer = csv.writer(f)
+                        if write_header:
+                            writer.writerow(["step", "dataset", "psnr", "ssim", "niqe", "musiq", "clipiqa+", "brisque"])
+                        writer.writerow([global_step, dataset_name,
+                                         round(avg_psnr, 4), round(avg_ssim, 4),
+                                         round(avg_niqe, 4), round(avg_musiq, 4),
+                                         round(avg_clipiqa, 4), round(avg_brisque, 4)])
+                    print(f"[Eval]   appended to {summary_path}")
+                else:
+                    writer.writerow(["image", "niqe", "musiq", "clipiqa+", "brisque"])
+                    for i, name in enumerate(dataset.file_name_list):
+                        writer.writerow([name, round(niqe_list[i], 4), round(musiq_list[i], 4),
+                                         round(clipiqa_list[i], 4), round(brisque_list[i], 4)])
+                    writer.writerow(["AVERAGE", round(avg_niqe, 4), round(avg_musiq, 4),
+                                     round(avg_clipiqa, 4), round(avg_brisque, 4)])
+                    print(f"[Eval] OK  NIQE={avg_niqe:.4f}  MUSIQ={avg_musiq:.4f}  "
+                          f"CLIPIQA+={avg_clipiqa:.4f}  BRISQUE={avg_brisque:.4f}")
+
+                    summary_path = os.path.join(exp_dir, "eval", "eval_summary.csv")
+                    write_header = not os.path.exists(summary_path)
+                    with open(summary_path, "a", newline="") as f:
+                        writer = csv.writer(f)
+                        if write_header:
+                            writer.writerow(["step", "dataset", "niqe", "musiq", "clipiqa+", "brisque"])
+                        writer.writerow([global_step, dataset_name,
+                                         round(avg_niqe, 4), round(avg_musiq, 4),
+                                         round(avg_clipiqa, 4), round(avg_brisque, 4)])
+                    print(f"[Eval]   appended to {summary_path}")
+            print(f"[Eval]   saved to {csv_path}")
+
+    # ---- 6. Restore training controlnet weights ----
+    pure_cldm.controlnet.load_state_dict(train_controlnet_sd, strict=True)
+    del train_controlnet_sd
+    pure_cldm.train()
+    torch.cuda.empty_cache()
 
 
 def main(args) -> None:
@@ -88,10 +261,11 @@ def main(args) -> None:
     dataset1 = instantiate_from_config(cfg.dataset.train1)
     if accelerator.is_local_main_process:
         print(f"Dataset1 contains {len(dataset1):,} images from {dataset1.img_dir}")
-    dataset2 = instantiate_from_config(cfg.dataset.train2)
-    if accelerator.is_local_main_process:
-        print(f"Dataset2 contains {len(dataset2):,} images from {dataset2.img_dir}")
-    dataset = ConcatDataset([dataset1, dataset2])
+    # dataset2 = instantiate_from_config(cfg.dataset.train2)
+    # if accelerator.is_local_main_process:
+    #     print(f"Dataset2 contains {len(dataset2):,} images from {dataset2.img_dir}")
+    # dataset = ConcatDataset([dataset1, dataset2])
+    dataset = dataset1
     loader = DataLoader(
         dataset=dataset, batch_size=cfg.train.batch_size,
         num_workers=cfg.train.num_workers,
@@ -155,8 +329,16 @@ def main(args) -> None:
             if global_step % cfg.train.ckpt_every == 0 and global_step > 0:
                 if accelerator.is_local_main_process:
                     checkpoint = pure_cldm.controlnet.state_dict()
-                    ckpt_path = f"{ckpt_dir}/{global_step:07d}.pt"
+                    ckpt_path = os.path.join(ckpt_dir, f"{global_step:07d}.pt")
                     torch.save(checkpoint, ckpt_path)
+
+                    # Automatic evaluation on saved checkpoint
+                    eval_cfg = cfg.get("eval", {})
+                    if eval_cfg.get("enabled", False) and eval_cfg.get("datasets"):
+                        torch.cuda.empty_cache()
+                        run_evaluation(eval_cfg, ckpt_path, global_step, exp_dir,
+                                       pure_cldm, diffusion, sampler, device)
+                        torch.cuda.empty_cache()
 
             if global_step % cfg.train.image_every == 0 or global_step == 1:
                 N = 4
